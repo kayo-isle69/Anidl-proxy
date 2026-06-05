@@ -29,52 +29,168 @@ function pickBestVideo(videos, wantedQuality) {
   return videos[0];
 }
 
-// ── Strategy 1: ok.ru internal GWT/API call ──────────────────────────────────
-async function resolveViaApi(videoId) {
-  // ok.ru uses a token-based API — first get the page to grab the tkn
+// ── GWT-RPC helpers ───────────────────────────────────────────────────────────
+
+// GWT wire format: //OK[<csv of values>]  or  //EX[<csv>] on error.
+// Values are a mix of numbers (indices into string table) and raw primitives.
+// The last comma-separated chunk before the closing ] is the string table array.
+// Table is 1-indexed: value "5" means strings[5-1].
+function parseGwtResponse(raw) {
+  if (!raw || raw.trim() === '') throw new Error('Empty GWT response');
+  if (raw.startsWith('//EX')) throw new Error('GWT server error: ' + raw.slice(0, 200));
+  if (!raw.startsWith('//OK')) throw new Error('Unexpected GWT response: ' + raw.slice(0, 200));
+
+  // Strip //OK[ ... ]
+  const inner = raw.replace(/^\/\/OK\[/, '').replace(/\]\s*$/, '');
+
+  // Tokenise respecting quoted strings
+  const tokens = [];
+  let cur = '';
+  let inStr = false;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === '"' && inner[i - 1] !== '\\') { inStr = !inStr; cur += c; }
+    else if (c === ',' && !inStr) { tokens.push(cur); cur = ''; }
+    else { cur += c; }
+  }
+  if (cur !== '') tokens.push(cur);
+
+  // Last token is the string table count, second-to-last group are the strings
+  // The format is: [data values...], [string table length (int)]
+  // String table entries appear as quoted strings interspersed in reverse
+  // Simplest robust approach: collect all quoted strings as the table,
+  // and all unquoted tokens as the value stack.
+  const stringTable = [];
+  const valueStack = [];
+  for (const t of tokens) {
+    const trimmed = t.trim();
+    if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+      stringTable.push(trimmed.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\'));
+    } else {
+      valueStack.push(trimmed);
+    }
+  }
+
+  return { stringTable, valueStack };
+}
+
+// Scan every string in the table for CDN video URLs
+function extractUrlsFromGwtStrings(stringTable) {
+  const results = [];
+  const cdnPattern = /^https?:\/\/(vd\d+\.okcdn\.ru|ukvd\d*\.okcdn\.ru|cdntu\.okcdn\.ru)[^\s]+/;
+  const hlsPattern = /^https?:\/\/[^\s]+\.m3u8[^\s]*/;
+
+  for (const s of stringTable) {
+    if (cdnPattern.test(s)) {
+      // Infer quality from URL param or path hint if present
+      const qMatch = s.match(/[?&](?:qual|quality|res|bitrate)=([^&]+)/i)
+                  || s.match(/\/(1080|720|480|360|240|144)p?\//);
+      const quality = qMatch ? qMatch[1] + (qMatch[1].match(/^\d+$/) ? 'p' : '') : 'cdn';
+      results.push({ quality, url: s });
+    } else if (hlsPattern.test(s)) {
+      results.push({ quality: 'hls', url: s });
+    }
+  }
+  return results;
+}
+
+// ── Strategy 1: GWT-RPC (primary — this is what ok.ru player actually uses) ───
+async function resolveViaGwt(videoId) {
   const embedUrl = `https://ok.ru/videoembed/${videoId}`;
+
+  // Step 1: fetch embed page to extract gwtHash (permutation strong name)
   const pageRes = await fetch(embedUrl, {
     headers: {
       'User-Agent': BROWSER_HEADERS['User-Agent'],
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
       'Referer': 'https://ok.ru/',
     }
   });
+  if (!pageRes.ok) throw new Error(`Embed page fetch failed: ${pageRes.status}`);
   const html = await pageRes.text();
 
-  // Extract gwtHash and other params from pageCtx
-  const ctxMatch = html.match(/var\s+pageCtx\s*=\s*(\{.+?\});/s);
-  if (!ctxMatch) throw new Error('pageCtx not found in HTML');
-
-  let pageCtx;
-  try {
-    pageCtx = JSON.parse(ctxMatch[1].replace(/,\s*\}/, '}'));
-  } catch {
-    // pageCtx has numeric keys which aren't valid JSON — extract gwtHash manually
-  }
-
   const gwtHashMatch = html.match(/"gwtHash"\s*:\s*"([^"]+)"/);
-  const gwtHash = gwtHashMatch ? gwtHashMatch[1] : null;
+  if (!gwtHashMatch) throw new Error('gwtHash not found in embed page');
+  const gwtHash = gwtHashMatch[1];
 
-  // Try the video info API endpoint
-  const apiUrl = `https://ok.ru/api/videoembed/getVideoInfo`;
-  const params = new URLSearchParams({
-    videoId: videoId,
-    retry: '0',
+  // Step 2: build the GWT-RPC payload
+  // Format: VERSION|FLAGS|STRING_TABLE_COUNT|strings...|method_args...|
+  // For VideoService.getVideoInfo(String videoId):
+  const GWT_VERSION = '7';
+  const GWT_FLAGS = '0';
+  const MODULE_BASE = 'https://ok.ru/';
+  const SERVICE_IFACE = 'ru.odnoklassniki.client.video.VideoService';
+  const METHOD_NAME = 'getVideoInfo';
+  const PARAM_TYPE = 'java.lang.String/2004016611';
+
+  // String table: MODULE_BASE, gwtHash, SERVICE_IFACE, METHOD_NAME, PARAM_TYPE, videoId
+  const stringTable = [MODULE_BASE, gwtHash, SERVICE_IFACE, METHOD_NAME, PARAM_TYPE, videoId];
+  const payload = [
+    GWT_VERSION,
+    GWT_FLAGS,
+    stringTable.length.toString(),
+    ...stringTable,
+    '1',  // param count
+    '2',  // string table ref: SERVICE_IFACE (index 3 → "3")
+    '3',  // METHOD_NAME
+    '4',  // PARAM_TYPE
+    '5',  // param count = 1
+    '6',  // videoId value ref
+  ].join('|');
+
+  // Step 3: POST to the GWT-RPC endpoint
+  const gwtUrl = `https://ok.ru/gwt/videoService`;
+  const gwtRes = await fetch(gwtUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'text/x-gwt-rpc; charset=UTF-8',
+      'X-GWT-Module-Base': MODULE_BASE,
+      'X-GWT-Permutation': gwtHash,
+      'Referer': embedUrl,
+      'Origin': 'https://ok.ru',
+      'User-Agent': BROWSER_HEADERS['User-Agent'],
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    body: payload,
   });
+
+  const rawResponse = await gwtRes.text();
+
+  // Step 4: parse the wire-format response
+  const { stringTable: respStrings, valueStack } = parseGwtResponse(rawResponse);
+
+  // Try structured extraction first
+  let videos = extractUrlsFromGwtStrings(respStrings);
+
+  // Deduplicate (same URL might appear in multiple resolutions in the table)
+  const seen = new Set();
+  videos = videos.filter(v => {
+    if (seen.has(v.url)) return false;
+    seen.add(v.url);
+    return true;
+  });
+
+  if (videos.length > 0) return { videos, gwtHash, rawResponse };
+
+  // If no CDN URLs found, return raw strings for debugging
+  return { videos: [], gwtHash, rawResponse, rawStrings: respStrings };
+}
+
+// ── Strategy 2 (was 1): ok.ru JSON API endpoint ───────────────────────────────
+async function resolveViaApi(videoId) {
+  const embedUrl = `https://ok.ru/videoembed/${videoId}`;
+  const apiUrl = `https://ok.ru/api/videoembed/getVideoInfo`;
+  const params = new URLSearchParams({ videoId, retry: '0' });
 
   const apiRes = await fetch(`${apiUrl}?${params}`, {
-    headers: {
-      ...BROWSER_HEADERS,
-      'Referer': embedUrl,
-    }
+    headers: { ...BROWSER_HEADERS, 'Referer': embedUrl }
   });
+  if (!apiRes.ok) return null;
 
-  if (apiRes.ok) {
-    const data = await apiRes.json();
-    if (data && (data.videos || data.hlsManifestUrl)) return parseVideoData(data);
-  }
-
+  const data = await apiRes.json();
+  if (data && (data.videos || data.hlsManifestUrl)) return parseVideoData(data);
   return null;
 }
 
@@ -175,7 +291,19 @@ app.get('/resolve', async (req, res) => {
   const tried = [];
 
   try {
-    // Strategy 1: API
+    // Strategy 1: GWT-RPC (primary — mirrors what the ok.ru player actually does)
+    tried.push('gwt');
+    const gwtResult = await resolveViaGwt(id);
+    if (gwtResult.videos && gwtResult.videos.length > 0) {
+      const chosen = pickBestVideo(gwtResult.videos, quality);
+      return res.json({ id, strategy: 'gwt', gwtHash: gwtResult.gwtHash, chosen, allQualities: gwtResult.videos });
+    }
+    // GWT responded but we couldn't parse URLs — log for debugging
+    tried.push(`gwt_no_urls:strings=${gwtResult.rawStrings?.length ?? 0}`);
+  } catch (e) { tried.push(`gwt_err:${e.message}`); }
+
+  try {
+    // Strategy 2: JSON API endpoint
     tried.push('api');
     const apiResult = await resolveViaApi(id);
     if (apiResult && apiResult.length > 0) {
@@ -185,7 +313,7 @@ app.get('/resolve', async (req, res) => {
   } catch (e) { tried.push(`api_err:${e.message}`); }
 
   try {
-    // Strategy 2: Embed page scrape
+    // Strategy 3: Embed page scrape
     tried.push('embed');
     const embedResult = await resolveViaEmbed(id);
     if (embedResult && embedResult.length > 0) {
@@ -195,7 +323,7 @@ app.get('/resolve', async (req, res) => {
   } catch (e) { tried.push(`embed_err:${e.message}`); }
 
   try {
-    // Strategy 3: Video page scrape
+    // Strategy 4: Video page scrape
     tried.push('videopage');
     const pageResult = await resolveViaVideoPage(id);
     if (pageResult && pageResult.length > 0) {
@@ -207,8 +335,31 @@ app.get('/resolve', async (req, res) => {
   return res.status(422).json({
     error: 'All strategies failed to find video URLs',
     tried,
-    hint: 'Run /debug?id=' + id + ' to inspect raw HTML and report back',
+    hint: 'Run /gwt-debug?id=' + id + ' to inspect raw GWT response',
   });
+});
+
+// ── /gwt-debug ────────────────────────────────────────────────────────────────
+// Shows the raw GWT-RPC response + parsed string table — use this when /resolve
+// fails to understand what ok.ru is actually returning.
+app.get('/gwt-debug', async (req, res) => {
+  const { id } = req.query;
+  if (!id) return res.status(400).json({ error: 'Missing id' });
+
+  try {
+    const result = await resolveViaGwt(id);
+    res.json({
+      id,
+      gwtHash: result.gwtHash,
+      parsedVideos: result.videos,
+      stringTableLength: result.rawStrings?.length ?? '(urls found, skipped)',
+      stringTable: result.rawStrings ?? '(not captured — videos were found)',
+      // First 2000 chars of raw response for inspection
+      rawResponsePreview: result.rawResponse?.slice(0, 2000),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── /stream ───────────────────────────────────────────────────────────────────
@@ -319,3 +470,4 @@ app.listen(PORT, () => {
   console.log(`   Player:  http://localhost:${PORT}/player?id=11443520473746`);
   console.log(`   Resolve: http://localhost:${PORT}/resolve?id=11443520473746\n`);
 });
+  
