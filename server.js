@@ -110,7 +110,7 @@ async function resolveViaGwt(videoId) {
   if (!pageRes.ok) throw new Error(`Embed page fetch failed: ${pageRes.status}`);
   const html = await pageRes.text();
 
-  const gwtHashMatch = html.match(/"gwtHash"\s*:\s*"([^"]+)"/);
+  const gwtHashMatch = html.match(/gwtHash\s*:\s*"([^"]+)"/);
   if (!gwtHashMatch) throw new Error('gwtHash not found in embed page');
   const gwtHash = gwtHashMatch[1];
 
