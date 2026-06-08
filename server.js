@@ -458,7 +458,42 @@ app.get('/player', (req, res) => {
 </body>
 </html>`);
 });
+app.get('/cookie-debug', async (req, res) => {
+  const { id } = req.query;
+  if (!id) return res.status(400).json({ error: 'Missing id' });
+  
+  const embedUrl = `https://ok.ru/videoembed/${id}`;
+  const pageRes = await fetch(embedUrl, {
+    headers: {
+      'User-Agent': BROWSER_HEADERS['User-Agent'],
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://ok.ru/',
+    }
+  });
+  const html = await pageRes.text();
+  
+  const rawCookies = pageRes.headers.raw?.()?.['set-cookie']
+    ?? pageRes.headers.getSetCookie?.()
+    ?? [];
 
+  // Grab anything that looks like a GWT service URL from the page JS
+  const gwtUrls = [...html.matchAll(/["'](\/[^"']*(?:gwt|rpc|service|video)[^"']*?)["']/gi)]
+    .map(m => m[1])
+    .filter(u => u.length < 100);
+
+  // Also grab the moduleBase hint
+  const moduleBase = html.match(/moduleBase\s*[=:]\s*["']([^"']+)["']/)?.[1];
+  const gwtHash = html.match(/gwtHash\s*:\s*"([^"]+)"/)?.[1];
+
+  res.json({
+    cookieCount: rawCookies.length,
+    cookies: rawCookies.map(c => c.split(';')[0]),
+    gwtUrlCandidates: [...new Set(gwtUrls)],
+    moduleBase,
+    gwtHash,
+  });
+});
 app.get('/', (req, res) => res.json({
   endpoints: {
     '/resolve?id=<videoId>': 'Returns all quality URLs (JSON)',
@@ -473,4 +508,4 @@ app.listen(PORT, () => {
   console.log(`   Player:  http://localhost:${PORT}/player?id=11443520473746`);
   console.log(`   Resolve: http://localhost:${PORT}/resolve?id=11443520473746\n`);
 });
-    
+                       
