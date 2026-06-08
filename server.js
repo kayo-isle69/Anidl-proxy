@@ -98,7 +98,7 @@ function extractUrlsFromGwtStrings(stringTable) {
 async function resolveViaGwt(videoId) {
   const embedUrl = `https://ok.ru/videoembed/${videoId}`;
 
-  // Step 1: fetch embed page to extract gwtHash (permutation strong name)
+  // Step 1: fetch embed page to extract gwtHash + session cookies
   const pageRes = await fetch(embedUrl, {
     headers: {
       'User-Agent': BROWSER_HEADERS['User-Agent'],
@@ -110,33 +110,36 @@ async function resolveViaGwt(videoId) {
   if (!pageRes.ok) throw new Error(`Embed page fetch failed: ${pageRes.status}`);
   const html = await pageRes.text();
 
+  // Carry session cookies into the GWT POST (ok.ru validates them)
+  const rawCookies = pageRes.headers.raw?.()?.['set-cookie']
+    ?? pageRes.headers.getSetCookie?.()
+    ?? [];
+  const cookieHeader = rawCookies
+    .map(c => c.split(';')[0])
+    .join('; ');
+
   const gwtHashMatch = html.match(/gwtHash\s*:\s*"([^"]+)"/);
   if (!gwtHashMatch) throw new Error('gwtHash not found in embed page');
   const gwtHash = gwtHashMatch[1];
 
   // Step 2: build the GWT-RPC payload
-  // Format: VERSION|FLAGS|STRING_TABLE_COUNT|strings...|method_args...|
-  // For VideoService.getVideoInfo(String videoId):
-  const GWT_VERSION = '7';
-  const GWT_FLAGS = '0';
   const MODULE_BASE = 'https://ok.ru/';
   const SERVICE_IFACE = 'ru.odnoklassniki.client.video.VideoService';
   const METHOD_NAME = 'getVideoInfo';
   const PARAM_TYPE = 'java.lang.String/2004016611';
 
-  // String table: MODULE_BASE, gwtHash, SERVICE_IFACE, METHOD_NAME, PARAM_TYPE, videoId
   const stringTable = [MODULE_BASE, gwtHash, SERVICE_IFACE, METHOD_NAME, PARAM_TYPE, videoId];
   const payload = [
-    GWT_VERSION,
-    GWT_FLAGS,
+    '7',                          // GWT version
+    '0',                          // flags
     stringTable.length.toString(),
     ...stringTable,
-    '1',  // param count
-    '2',  // string table ref: SERVICE_IFACE (index 3 → "3")
-    '3',  // METHOD_NAME
-    '4',  // PARAM_TYPE
+    '1',  // number of parameters
+    '2',  // ref → SERVICE_IFACE
+    '3',  // ref → METHOD_NAME
+    '4',  // ref → PARAM_TYPE
     '5',  // param count = 1
-    '6',  // videoId value ref
+    '6',  // ref → videoId
   ].join('|');
 
   // Step 3: POST to the GWT-RPC endpoint
@@ -152,19 +155,19 @@ async function resolveViaGwt(videoId) {
       'User-Agent': BROWSER_HEADERS['User-Agent'],
       'Accept': '*/*',
       'Accept-Language': 'en-US,en;q=0.9',
+      ...(cookieHeader && { 'Cookie': cookieHeader }),
     },
     body: payload,
   });
 
   const rawResponse = await gwtRes.text();
 
-  // Step 4: parse the wire-format response
+  // Step 4: parse wire-format response
   const { stringTable: respStrings, valueStack } = parseGwtResponse(rawResponse);
 
-  // Try structured extraction first
   let videos = extractUrlsFromGwtStrings(respStrings);
 
-  // Deduplicate (same URL might appear in multiple resolutions in the table)
+  // Deduplicate
   const seen = new Set();
   videos = videos.filter(v => {
     if (seen.has(v.url)) return false;
@@ -174,7 +177,7 @@ async function resolveViaGwt(videoId) {
 
   if (videos.length > 0) return { videos, gwtHash, rawResponse };
 
-  // If no CDN URLs found, return raw strings for debugging
+  // No URLs found — return raw strings so /gwt-debug can show them
   return { videos: [], gwtHash, rawResponse, rawStrings: respStrings };
 }
 
@@ -470,4 +473,4 @@ app.listen(PORT, () => {
   console.log(`   Player:  http://localhost:${PORT}/player?id=11443520473746`);
   console.log(`   Resolve: http://localhost:${PORT}/resolve?id=11443520473746\n`);
 });
-  
+    
