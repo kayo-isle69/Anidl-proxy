@@ -477,6 +477,39 @@ app.get('/player', (req, res) => {
 </body>
 </html>`);
 });
+app.get('/nocache-debug', async (req, res) => {
+  const { id } = req.query;
+  if (!id) return res.status(400).json({ error: 'Missing id' });
+
+  const embedUrl = `https://ok.ru/videoembed/${id}`;
+  const pageRes = await fetch(embedUrl, {
+    headers: {
+      'User-Agent': BROWSER_HEADERS['User-Agent'],
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://ok.ru/',
+    }
+  });
+  const html = await pageRes.text();
+
+  // Find all script tags
+  const scripts = [...html.matchAll(/<script[^>]*src=["']([^"']+)["'][^>]*>/gi)]
+    .map(m => m[1]);
+
+  // Find nocache.js specifically (GWT bootstrap)
+  const nocacheScripts = scripts.filter(s => s.includes('nocache'));
+
+  // Also grab any .js src that mentions video/player/gwt
+  const relevantScripts = scripts.filter(s =>
+    /nocache|gwt|player|video|embed/i.test(s)
+  );
+
+  // Grab moduleBase from inline JS
+  const moduleBase = [...html.matchAll(/moduleBase\s*[=:]\s*["']([^"']+)["']/gi)]
+    .map(m => m[1]);
+
+  res.json({ nocacheScripts, relevantScripts, moduleBase, allScripts: scripts });
+});
 app.get('/cookie-debug', async (req, res) => {
   const { id } = req.query;
   if (!id) return res.status(400).json({ error: 'Missing id' });
