@@ -342,7 +342,7 @@ app.get('/resolve', async (req, res) => {
   });
 });
 app.get('/js-debug', async (req, res) => {
-  const jsUrl = 'https://st.okcdn.ru/static/MegaPlayer/10-12-1/okVideoPlayerUtils.min.js';
+  const jsUrl = 'https://st.okcdn.ru/static/one-video-player/0-3-45/one-video-player.js';
   const r = await fetch(jsUrl, {
     headers: { 'User-Agent': BROWSER_HEADERS['User-Agent'], 'Referer': 'https://ok.ru/' }
   });
