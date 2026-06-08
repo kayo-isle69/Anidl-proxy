@@ -341,7 +341,26 @@ app.get('/resolve', async (req, res) => {
     hint: 'Run /gwt-debug?id=' + id + ' to inspect raw GWT response',
   });
 });
+app.get('/js-debug', async (req, res) => {
+  const jsUrl = 'https://st.okcdn.ru/static/MegaPlayer/10-12-1/okVideoPlayerUtils.min.js';
+  const r = await fetch(jsUrl, {
+    headers: { 'User-Agent': BROWSER_HEADERS['User-Agent'], 'Referer': 'https://ok.ru/' }
+  });
+  const js = await r.text();
 
+  // Find anything that looks like an RPC/service path
+  const rpcPaths = [...js.matchAll(/["'](\/[^"']{3,60}(?:rpc|gwt|service|video|player)[^"']{0,40})["']/gi)]
+    .map(m => m[1]);
+
+  // Also grab 200 chars around "gwt" mentions
+  const gwtContext = [...js.matchAll(/.{0,80}gwt.{0,80}/gi)].map(m => m[0]).slice(0, 10);
+
+  res.json({
+    jsSize: js.length,
+    rpcPaths: [...new Set(rpcPaths)],
+    gwtContext,
+  });
+});
 // ── /gwt-debug ────────────────────────────────────────────────────────────────
 // Shows the raw GWT-RPC response + parsed string table — use this when /resolve
 // fails to understand what ok.ru is actually returning.
